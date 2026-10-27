@@ -21,12 +21,12 @@ python3 --version
 
 ## 2. Download the code
 
+On the repository page, click the green **Code** button and copy the HTTPS address. Then:
+
 ```bash
-git clone https://github.com/OWNER/dtu-robotics.git
+git clone PASTE_THE_ADDRESS_HERE
 cd dtu-robotics
 ```
-
-Replace the address above with the link from this repository's green **Code** button if it is different.
 
 ## 3. Install the Python packages
 
