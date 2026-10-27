@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+teach_history.json
+teach_limits.json
