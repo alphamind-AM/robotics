@@ -6,13 +6,18 @@ from robot.arm import MyRobot
 def main():
     parser = argparse.ArgumentParser(description="Hand-teach the arm, or play back saved poses.")
     parser.add_argument("--play", action="store_true", help="Play teach_history.json")
-    parser.add_argument("--vision", action="store_true", help="Laptop camera only, for vision development")
+    parser.add_argument("--vision", action="store_true", help="Webcam only. Draw rings on the live image. Does not connect to the robot.")
     parser.add_argument("--camera", default=None, help="Video device, e.g. /dev/video0 or /dev/video4")
     parser.add_argument("--no-camera", action="store_true", help="Do not open a camera window")
     parser.add_argument(
         "--check",
         action="store_true",
         help="Print joint angles and end-effector position. Does not connect to the robot.",
+    )
+    parser.add_argument(
+        "--view",
+        action="store_true",
+        help="Draw top and arm-plane views, with the commanded joint angles. Does not connect to the robot.",
     )
     parser.add_argument(
         "--joints",
@@ -26,7 +31,7 @@ def main():
         nargs=4,
         type=float,
         metavar=("X", "Y", "Z", "PITCH"),
-        help="Target x y z pitch_deg for inverse kinematics",
+        help="Target x y z pitch_deg. With --mission, the pose chosen at run time. Alone, an inverse-kinematics query.",
     )
     parser.add_argument(
         "--depth",
@@ -37,7 +42,7 @@ def main():
     parser.add_argument(
         "--mission",
         default=None,
-        help="Mission to run, e.g. square_with_x. With --check, only print the path.",
+        help="Mission to run, e.g. square_with_x. With --check or --view, do not connect to the robot.",
     )
     args = parser.parse_args()
 
@@ -50,8 +55,19 @@ def main():
             print(f"Unknown mission {args.mission}. Known missions: {known}")
             return
         mission = MISSIONS[args.mission]
+        context = {}
+        if args.pose is not None:
+            context["pose"] = tuple(args.pose)
+        if args.camera:
+            context["camera_device"] = args.camera
         if args.check:
-            preview_mission(mission)
+            preview_mission(mission, context)
+        if args.view:
+            from robot.visualize import view_mission
+
+            view_mission(mission, context)
+            return
+        if args.check:
             return
         robot = MyRobot(home_on_start=False, torque_on_start=False)
         if not robot.init_status:
@@ -63,8 +79,9 @@ def main():
             robot.set_torque_limit(robot.motor_torque)
             robot.hold_present_position()
             robot.enable_motors()
-            mission.run(robot)
+            mission.run(robot, context=context)
         finally:
+            robot.stop_camera()
             if robot.init_status:
                 robot.disable_motors()
         return
@@ -72,14 +89,20 @@ def main():
     if args.check or args.joints or args.pose or args.depth is not None:
         from robot.kinematics import preview
         preview(args.joints, args.pose, args.depth)
+    if args.view:
+        from robot.visualize import view_configuration
+
+        view_configuration(args.joints, args.pose)
+        return
+    if args.check or args.joints or args.pose or args.depth is not None:
         return
 
     if args.vision:
         from robot.camera import Camera
-        from robot.perception import detect_faces
+        from robot.perception import detect_rings
         camera = Camera()
         try:
-            camera.preview_detection(detect_faces, device=args.camera)
+            camera.preview_detection(detect_rings, device=args.camera)
         finally:
             camera.stop()
         return

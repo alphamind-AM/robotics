@@ -31,23 +31,38 @@ LINK_4 = 50  # wrist to the commanded point
 # kinematic zero. Leave a joint at 0.0 when the two zeros already match.
 JOINT_ZERO_DEG = np.array([
     0,#-180.0,  # j1
-    0,#90.0,   # j2
+    0.0,#90.0,   # j2
     0.0,   # j3
     0,#90.0,   # j4
 ], dtype=float)
 
+# The angle sent to the transform is
+#   theta = JOINT_SIGN * (joint + JOINT_ZERO) + theta_offset.
+#
+# Frame 0 has z up and x forward. Joint 1 yaws about that z.
+# alpha = -90° lays the next z horizontal, so joints 2, 3 and 4 pitch.
+# Joint 2's offset holds 0° straight up. Pitch signs are +1, so a
+# positive angle leans toward +x when joint 1 is 0. Joints 3 and 4 use
+# the same sign, and 0° continues the previous link. The horns use the
+# opposite pitch sign; robot/arm.py converts model angles before the bus.
+#   elbow  = (L2 sin q2,  L2 cos q2)           from the shoulder, in (x, z)
+#   wrist  = elbow + (L3 sin(q2+q3), L3 cos(q2+q3))
+#   pitch  = 90° - (q2 + q3 + q4)
 # Standard DH, one row per joint: a, alpha_deg, d, theta_offset_deg.
-# The angle used for row i is joint_i + JOINT_ZERO_DEG[i] + theta_offset.
-# Joint 2's offset puts 0° straight up: z = LINK_1 + LINK_2*cos(q2) + ...
+JOINT_SIGN = np.array([1.0, 1.0, 1.0, 1.0])
 DH_TABLE = np.array([
-    [0.0,     90.0, LINK_1, 0.0],
-    [LINK_2,   0.0, 0.0,    90.0],
+    [0.0,     -90.0, LINK_1, 0.0],
+    [LINK_2,  0.0, 0.0,    -90.0],
     [LINK_3,   0.0, 0.0,    0.0],
     [LINK_4,   0.0, 0.0,    0.0],
 ], dtype=float)
 
 # Planar arm has two solutions. Set True for the other elbow branch.
 ELBOW_UP = False
+
+# The base sits on the table. A link point below this height is a collision.
+# The base origin itself is allowed to be at 0.
+TABLE_Z = 0.0
 
 
 def cosd(angle_deg):
@@ -96,7 +111,7 @@ def dh_transform(a, alpha_deg, d, theta_deg):
 def _arm_frames(joint_angles_deg):
     """Base frame plus the four DH frames, each as a 4x4 pose in the base."""
     joints = np.asarray(joint_angles_deg, dtype=float).reshape(4)
-    q = joints + JOINT_ZERO_DEG
+    q = JOINT_SIGN * (joints + JOINT_ZERO_DEG)
     pose = np.eye(4)
     frames = [pose]
     for i in range(4):
@@ -135,7 +150,7 @@ def jacobian(joint_angles_deg, point_ee=None):
 
     jac = np.zeros((6, 4))
     for i in range(4):
-        axis = frames[i][:3, 2]
+        axis = frames[i][:3, 2] * JOINT_SIGN[i]
         origin = frames[i][:3, 3]
         jac[:3, i] = np.cross(axis, point - origin)
         jac[3:, i] = axis
@@ -165,8 +180,8 @@ def forward(joint_angles_deg):
     x, y, z = pose[0, 3], pose[1, 3], pose[2, 3]
     q1 = float(np.asarray(joint_angles_deg, dtype=float).reshape(4)[0] + JOINT_ZERO_DEG[0])
     tool_axis = pose[:3, 0]
-    # Positive reach is the direction x = -cos(q1)*reach, y = -sin(q1)*reach.
-    along_reach = -tool_axis[0] * cosd(q1) - tool_axis[1] * sind(q1)
+    # Positive reach is x = cos(q1)*reach, y = sin(q1)*reach.
+    along_reach = tool_axis[0] * cosd(q1) + tool_axis[1] * sind(q1)
     pitch_deg = atand2(tool_axis[2], along_reach)
     return np.array([x, y, z, pitch_deg], dtype=float)
 
@@ -178,60 +193,82 @@ def inverse(x, y, z, pitch_deg):
         [LINK_1, LINK_2, LINK_3, LINK_4],
     )
 
-    # Positive reach lies along (-cos j1, -sin j1). The opposite base yaw
+    # Positive reach lies along (cos j1, sin j1). The opposite base yaw
     # uses a negative reach. Keep whichever one reproduces this pose.
     r_total = math.hypot(x, y)
     z_wrist = (z - LINK_1) - LINK_4 * sind(pitch_deg)
     tool_horizontal = LINK_4 * cosd(pitch_deg)
     if r_total < 1e-9:
-        bases = [(0.0, -tool_horizontal)]
+        bases = [(0.0, -tool_horizontal), (180.0, -tool_horizontal)]
     else:
         bases = [
-            (atand2(-y, -x), r_total - tool_horizontal),
-            (atand2(y, x), -r_total - tool_horizontal),
+            (atand2(y, x), r_total - tool_horizontal),
+            (atand2(-y, -x), -r_total - tool_horizontal),
         ]
 
     target = np.array([x, y, z, pitch_deg], dtype=float)
     best = None
     best_error = None
+    lowest = None
     for j1, r_wrist in bases:
         arm = _arm_plane(r_wrist, z_wrist, pitch_deg)
         if arm is None:
             continue
         j2, j3, j4 = arm
-        joints = signed_deg(np.array([j1, j2, j3, j4], dtype=float) - JOINT_ZERO_DEG)
+        # q2, q3, q4 above grow toward +reach. JOINT_SIGN turns that into
+        # the model angle forward() consumes.
+        geometric = np.array([j1, j2, j3, j4], dtype=float)
+        joints = signed_deg(JOINT_SIGN * geometric - JOINT_ZERO_DEG)
+        height = _lowest_link_z(joints)
+        if height < TABLE_Z:
+            if lowest is None or height < lowest:
+                lowest = height
+            continue
         error = _pose_error(forward(joints), target)
         # Two bases can hit one pose. Keep the first unless the other is
         # actually closer, so a straight line does not flip the base by 180°.
         if best_error is None or error < best_error - 1e-4:
             best = joints
             best_error = error
+    if best is None and lowest is not None:
+        raise ValueError(
+            f"Elbow branch reaches z={lowest:.1f} mm, below the table at z={TABLE_Z:.0f}. "
+            "Use the other value of ELBOW_UP."
+        )
     if best is None:
         raise ValueError("Target point out of mechanical reach")
     return best
 
 
+def _lowest_link_z(joint_angles_deg):
+    """Lowest z of the shoulder, elbow, wrist, and tip. The base origin is excluded."""
+    frames = _arm_frames(joint_angles_deg)
+    return min(float(frame[2, 3]) for frame in frames[1:])
+
+
 def _arm_plane(r_wrist, z_wrist, pitch_deg):
     """Shoulder, elbow, and wrist for one signed horizontal reach.
 
-    The law of cosines is for an elbow measured from the horizontal.
-    Joint 2 in the DH table is measured from straight up, so j2 is
-    90° minus that angle, and j3 takes the opposite sign. The tool
-    pitch then closes with j2 + j3 + j4 = 90° - pitch.
+    q2 is measured from straight up toward +reach. q3 = 0 continues link 2.
+    A negative q3 puts the elbow on the far side of the shoulder-wrist line.
+    The tool closes with q2 + q3 + q4 = 90° - pitch.
     """
-    cos_t3 = (r_wrist ** 2 + z_wrist ** 2 - LINK_2 ** 2 - LINK_3 ** 2) / (2 * LINK_2 * LINK_3)
-    if abs(cos_t3) > 1.0 + 1e-6:
+    cos_q3 = (r_wrist ** 2 + z_wrist ** 2 - LINK_2 ** 2 - LINK_3 ** 2) / (2 * LINK_2 * LINK_3)
+    if abs(cos_q3) > 1.0 + 1e-6:
         return None
-    cos_t3 = max(-1.0, min(1.0, cos_t3))
+    cos_q3 = max(-1.0, min(1.0, cos_q3))
 
-    theta3 = acosd(cos_t3)
-    if ELBOW_UP:
-        theta3 = -theta3
-    phi = atand2(z_wrist, r_wrist) - atand2(LINK_3 * sind(theta3), LINK_2 + LINK_3 * cosd(theta3))
-    j2 = 90.0 - phi
-    j3 = -theta3
-    j4 = 90.0 - pitch_deg - j2 - j3
-    return j2, j3, j4
+    q3 = acosd(cos_q3)
+    if not ELBOW_UP:
+        q3 = -q3
+    along = LINK_2 + LINK_3 * cosd(q3)
+    across = LINK_3 * sind(q3)
+    scale = along * along + across * across
+    if scale < 1e-9:
+        return None
+    q2 = atand2(along * r_wrist - across * z_wrist, along * z_wrist + across * r_wrist)
+    q4 = 90.0 - pitch_deg - q2 - q3
+    return q2, q3, q4
 
 
 def _pose_error(pose, target):

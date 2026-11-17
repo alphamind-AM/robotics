@@ -7,6 +7,24 @@ from robot.camera import Camera
 from robot.kinematics import forward, inverse, signed_deg
 
 
+# Degrees. move_j rejects a command outside this, before it is sent.
+# Joint 1 is the narrow one: the base cannot yaw to ±180°.
+# These limits are model angles: 0 is straight up, positive pitch leans +x.
+JOINT_LIMITS_DEG = np.array(
+    [[-130.0, 130.0], [-180.0, 180.0], [-140.0, 140.0], [-140.0, 140.0]],
+    dtype=float,
+)
+
+# Horn angle = SERVO_SIGN * model angle + SERVO_BIAS.
+# Bench check with known_poses, before this map:
+#   joints (0, 0, 0, 0) put the tool along +x, not up. That is the wrist
+#   horn: its zero is the +x tool, 90° off the forearm.
+#   a positive joint-2 command swung the arm toward -x.
+# Joints 3 and 4 share that pitch direction. Joint 1 is unchanged.
+SERVO_SIGN = np.array([1.0, -1.0, -1.0, -1.0])
+SERVO_BIAS_DEG = np.array([0.0, 0.0, 0.0, 90.0])
+
+
 class MyRobot:
     """Joint-level arm. Asks the bus for bytes and kinematics for poses."""
 
@@ -20,7 +38,7 @@ class MyRobot:
         self.use_smooth_speed_flag = False
         self.gripper_open_flag = True
 
-        self.joint_limits = np.array([[-130, 130], [-180, 180], [-140, 140], [-140, 140]])
+        self.joint_limits = JOINT_LIMITS_DEG.copy()
         self.ik_weights = np.array([0.25, 0.25, 0.25, 1, 1, 1])
         self.joint_offsets = np.array([150, 150, 150, 150], dtype=float)
         self.joint_angle_error = np.array([0.0, 0.0, 0.0, 0.0])
@@ -134,22 +152,38 @@ class MyRobot:
         ticks = self.bus.read2(motor_id, self.bus.ADDR_PRESENT_POSITION)
         return self.bus.ticks_to_deg(ticks)
 
+    @staticmethod
+    def model_to_servo(model_deg):
+        """Model degrees -> horn degrees. See SERVO_SIGN."""
+        model_deg = np.asarray(model_deg, dtype=float).reshape(4)
+        return SERVO_SIGN * model_deg + SERVO_BIAS_DEG
+
+    @staticmethod
+    def servo_to_model(servo_deg):
+        """Horn degrees -> model degrees. Sign is ±1, so multiply inverts it."""
+        servo_deg = np.asarray(servo_deg, dtype=float).reshape(4)
+        return SERVO_SIGN * (servo_deg - SERVO_BIAS_DEG)
+
     def read_joint_angles(self):
-        j_a = np.zeros(4, dtype=float)
+        servo = np.zeros(4, dtype=float)
         for i, dxl_id in enumerate(self.motor_ids):
             ticks = self.bus.read2(dxl_id, self.bus.ADDR_PRESENT_POSITION)
-            deg = self.bus.ticks_to_deg(ticks) - self.joint_offsets[i]
-            j_a[i] = deg
-            self.joint_angle_error[i] = deg - self.joint_angles[i]
-        return j_a
+            servo[i] = self.bus.ticks_to_deg(ticks) - self.joint_offsets[i]
+        model = signed_deg(self.servo_to_model(servo))
+        self.joint_angle_error = model - self.joint_angles
+        return model
+
+    def _write_model(self, model_deg):
+        servo = self.model_to_servo(model_deg)
+        cmd_deg = servo + self.joint_offsets
+        for i, dxl_id in enumerate(self.motor_ids):
+            self.bus.write2(dxl_id, self.bus.ADDR_GOAL_POSITION, self.bus.deg_to_ticks(cmd_deg[i]))
 
     def hold_present_position(self):
         """Write the current pose as the goal so enabling torque does not jump the arm."""
         ja = self.read_joint_angles()
         self.joint_angles = ja.copy()
-        cmd_deg = ja + self.joint_offsets
-        for i, dxl_id in enumerate(self.motor_ids):
-            self.bus.write2(dxl_id, self.bus.ADDR_GOAL_POSITION, self.bus.deg_to_ticks(cmd_deg[i]))
+        self._write_model(ja)
         return ja
 
     def move_j(self, j1_deg, j2_deg, j3_deg, j4_deg, wait=True, tol_deg=2.0, poll_period=0.05):
@@ -160,9 +194,7 @@ class MyRobot:
         if self.use_smooth_speed_flag:
             self.smooth_speed(desired - self.joint_angles)
 
-        cmd_deg = desired + self.joint_offsets
-        for i, dxl_id in enumerate(self.motor_ids):
-            self.bus.write2(dxl_id, self.bus.ADDR_GOAL_POSITION, self.bus.deg_to_ticks(cmd_deg[i]))
+        self._write_model(desired)
 
         if not wait:
             return

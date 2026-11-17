@@ -1,12 +1,16 @@
 """go to 37 points equidistant on a circle of radius 32 mm,
-centered at (150, 0, 120) with pitch 0.
+centered at (-150, 0, 120) with pitch 0.
+
+The circle is the assignment circle reflected through the yz plane, so the
+arm reaches out to -x. That is the front of this arm. +x is the back, over
+the base.
 """
 
 from robot.mission import Mission, go
 import numpy as np
 
 RADIUS = 32.0
-center = (150.0, 0.0, 120.0)
+center = (150.0, 0, 120.0)
 pitch = 0.0
 
 
@@ -39,14 +43,19 @@ def series_of_points_on_circle(circle_center, radius, num_points):
     points = []
     for i in range(num_points):
         angle = 2 * np.pi * i / num_points
-        points.append(go(circle_pose(angle, circle_center, radius), f"circle {i + 1}"))
+        # Elbow-down swings the elbow through the table at the bottom of the
+        # circle. Keep this branch for every point. A per-point switch would
+        # throw joint 3 by about 220°.
+        points.append(
+            go(circle_pose(angle, circle_center, radius), f"circle {i + 1}", elbow_up=True)
+        )
     return points
 
 
 problem_3 = Mission(
     "problem_3",
     [
-        go(_pose(*center, pitch), "go to center"),
+        #go(_pose(*center, pitch), "go to center"),
         *series_of_points_on_circle(center, RADIUS, 37)
     ],
 )

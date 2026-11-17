@@ -1,6 +1,6 @@
 from robot.calibration import pixel_to_point
 from robot.kinematics import inverse
-from robot.perception import detect_faces
+from robot.perception import detect_rings
 from robot.trajectory import follow_line, joint_trajectory
 
 
@@ -18,18 +18,19 @@ def follow_joint_waypoints(robot, waypoints, duration_s):
     return samples
 
 
-def point_at_faces(robot, camera):
-    """Aim the arm at the largest face in one camera frame.
+def point_at_ring(robot, camera):
+    """Aim the arm at the strongest ring hole in one camera frame.
 
-    Wire-up for later: frame -> face box -> robot point -> inverse -> move_j.
+    Wire-up for later: frame -> ring -> robot point -> inverse -> move_j.
+    Inserting the stylus is a later step. This only turns toward the hole
+    center, and it still needs pixel_to_point.
     """
     frame = camera.read_frame()
-    faces = detect_faces(frame)
-    if not faces:
+    rings = detect_rings(frame)
+    if not rings:
         return None
-    u, v, w, h = faces[0]
-    center = (u + w / 2.0, v + h / 2.0)
-    x, y, z, pitch_deg = pixel_to_point(center, frame.shape)
+    ring = rings[0]
+    x, y, z, pitch_deg = pixel_to_point((ring.u, ring.v), frame.shape)
     joints = inverse(x, y, z, pitch_deg)
     robot.move_j(*joints)
-    return faces[0]
+    return ring
